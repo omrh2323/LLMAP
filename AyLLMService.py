@@ -1,0 +1,429 @@
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+import torch
+import os
+import uuid
+import datetime
+import time
+import logging
+from redis import asyncio as aioredis
+from contextlib import asynccontextmanager
+from prometheus_fastapi_instrumentator import Instrumentator
+import uvicorn
+from typing import List, Generator
+import asyncio
+import json
+import threading
+import contextvars
+
+# === Configuration ===
+MODEL_NAME = os.getenv("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+API_KEY = os.getenv("API_KEY", "default_secret_key")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "120"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
+MAX_CONCURRENT_STREAMS = int(os.getenv("MAX_CONCURRENT_STREAMS", "10"))
+GPU_ENABLED = torch.cuda.is_available() and os.getenv("USE_GPU", "true").lower() == "true"
+DEVICE = "cuda" if GPU_ENABLED else "cpu"
+DTYPE = torch.float16 if GPU_ENABLED else torch.float32
+
+# === System Prompt ===
+SYSTEM_PROMPT = (
+    "You are AyAI, a specialized AI assistant developed for the AySearch project. "
+    "Your mission is to evaluate web content in terms of safety, quality, and meaning. "
+    "When necessary, provide short summaries and deliver objective, accurate feedback to the user."
+)
+
+# === Logging Setup ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(request_id)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("api_service.log")
+    ]
+)
+logger = logging.getLogger("AyAI-Service")
+
+# Context variable for request tracking
+request_id_ctx = contextvars.ContextVar("request_id", default="system")
+
+class RequestIDFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = request_id_ctx.get()
+        return True
+logger.addFilter(RequestIDFilter())
+
+# === Global State ===
+model = None
+tokenizer = None
+model_loading_lock = asyncio.Lock()
+model_loaded = asyncio.Event()
+redis_client = None
+
+# === Instrumentation Setup ===
+instrumentator = Instrumentator()
+
+# === App Lifecycle ===
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global redis_client
+    
+    # Initialize Redis
+    try:
+        redis_client = aioredis.from_url(REDIS_URL, encoding="utf8", decode_responses=True)
+        logger.info("Redis connected successfully")
+    except Exception as e:
+        logger.error(f"Redis connection failed: {str(e)}")
+        redis_client = None
+    
+    # Start model loading
+    asyncio.create_task(load_model())
+    
+    # Expose metrics endpoint
+    instrumentator.expose(app)
+    
+    yield
+    
+    # Cleanup resources
+    global model
+    if model:
+        if GPU_ENABLED:
+            with torch.no_grad():
+                torch.cuda.empty_cache()
+        del model
+        logger.info("Model resources released")
+    
+    if tokenizer:
+        del tokenizer
+    
+    if redis_client:
+        await redis_client.close()
+        logger.info("Redis connection closed")
+
+# Create app with lifespan
+app = FastAPI(lifespan=lifespan, title="AyAI Service", version="1.0")
+
+# Instrument the app (must be done AFTER app creation but BEFORE routes are added)
+instrumentator.instrument(app)
+
+# === Rate Limiting Middleware ===
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Generate request ID and set in context
+    req_id = str(uuid.uuid4())
+    request_id_ctx.set(req_id)
+    request.state.request_id = req_id
+    
+    # Skip rate limiting for health and info endpoints
+    if request.url.path in ["/health", "/info"]:
+        return await call_next(request)
+    
+    # Apply rate limiting
+    endpoint = request.url.path
+    client_ip = request.client.host if request.client else "unknown"
+    
+    try:
+        # Calculate cost based on endpoint
+        cost = 1
+        if endpoint == "/batch" and request.method == "POST":
+            # Read body for batch requests
+            body = await request.body()
+            try:
+                data = json.loads(body)
+                cost = min(len(data.get("prompts", [])), 10)
+            except:
+                cost = 10
+            # Restore body for downstream processing
+            request._body = body
+        
+        # Apply rate limit if Redis is available
+        if redis_client:
+            key = f"rate_limit:{client_ip}:{endpoint}"
+            current = await redis_client.get(key)
+            current = int(current) if current else 0
+            
+            if current + cost > MAX_REQUESTS_PER_MINUTE:
+                logger.warning(f"Rate limit exceeded for {client_ip} on {endpoint}")
+                raise HTTPException(status_code=429, detail="Too many requests")
+            
+            # Update rate limit
+            await redis_client.incrby(key, cost)
+            if current == 0:
+                await redis_client.expire(key, 60)
+        
+        # Process request
+        response = await call_next(request)
+        return response
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Middleware error: {str(e)}")
+        return await call_next(request)
+
+# === Model Loading ===
+async def load_model():
+    global model, tokenizer
+    async with model_loading_lock:
+        if model_loaded.is_set():
+            return
+            
+        logger.info("Starting model loading...")
+        start_time = time.time()
+        
+        try:
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            # Configuration for model loading
+            load_kwargs = {
+                "torch_dtype": DTYPE,
+                "low_cpu_mem_usage": True,
+            }
+            
+            if GPU_ENABLED:
+                load_kwargs["device_map"] = "auto"
+            
+            # Load model
+            model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
+            
+            # Use BetterTransformer if available
+            if GPU_ENABLED and hasattr(model, "to_bettertransformer"):
+                model = model.to_bettertransformer()
+                logger.info("Using BetterTransformer optimization")
+            
+            model_loaded.set()
+            logger.info(f"Model loaded in {time.time() - start_time:.2f}s | Device: {model.device}")
+            
+        except Exception as e:
+            logger.critical(f"Model loading failed: {str(e)}")
+            model_loaded.set()  # Prevent blocking
+            raise RuntimeError("Model initialization failed") from e
+
+# === Request Models ===
+class PromptInput(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=2048)
+    max_tokens: int = Field(default=500, ge=1, le=2048)
+    temperature: float = Field(default=0.7, ge=0.1, le=1.0)
+    stream: bool = Field(default=False)
+
+class BatchPromptInput(BaseModel):
+    prompts: List[str] = Field(..., min_items=1, max_items=32)
+    max_tokens: int = Field(default=500, ge=1, le=2048)
+    temperature: float = Field(default=0.7, ge=0.1, le=1.0)
+
+# === API Key Validation ===
+async def validate_api_key(request: Request):
+    if request.headers.get("x-api-key") != API_KEY:
+        client_ip = request.client.host if request.client else "unknown"
+        logger.warning(f"Invalid API key from {client_ip}")
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    return True
+
+# === Generation Utilities ===
+def format_prompt(prompt: str) -> str:
+    return f"{SYSTEM_PROMPT}\n\nUser: {prompt}\nAyAI:"
+
+def generate_response(prompt: str, max_tokens: int, temperature: float) -> str:
+    formatted_prompt = format_prompt(prompt)
+    
+    try:
+        inputs = tokenizer(
+            formatted_prompt, 
+            return_tensors="pt",
+            truncation=True, 
+            max_length=2048
+        ).to(model.device)
+        
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+            num_return_sequences=1
+        )
+        
+        # Extract only the generated text
+        response_start = inputs.input_ids.shape[-1]
+        response = outputs[0][response_start:]
+        return tokenizer.decode(response, skip_special_tokens=True).strip()
+        
+    except torch.cuda.OutOfMemoryError:
+        logger.error("CUDA out of memory during generation")
+        return "Error: Model overloaded, please try again"
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return "Error: Generation failed"
+
+async def generate_stream(prompt: str, max_tokens: int, temperature: float) -> Generator[str, None, None]:
+    formatted_prompt = format_prompt(prompt)
+    
+    inputs = tokenizer(
+        [formatted_prompt], 
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048
+    ).to(model.device)
+    
+    streamer = TextIteratorStreamer(
+        tokenizer, 
+        skip_prompt=True, 
+        skip_special_tokens=True,
+        timeout=300
+    )
+    
+    generation_kwargs = dict(
+        **inputs,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        do_sample=True,
+        streamer=streamer,
+        pad_token_id=tokenizer.eos_token_id
+    )
+    
+    # Run generation in separate thread
+    thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+    
+    # Stream tokens as they're generated
+    for token in streamer:
+        yield json.dumps({"token": token}) + "\n"
+        await asyncio.sleep(0.001)  # Yield control to event loop
+
+# === Batch Processing ===
+def process_batch(prompts: List[str], max_tokens: int, temperature: float) -> List[str]:
+    formatted_prompts = [format_prompt(p) for p in prompts]
+    
+    inputs = tokenizer(
+        formatted_prompts,
+        padding=True,
+        truncation=True,
+        max_length=2048,
+        return_tensors="pt"
+    ).to(model.device)
+    
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+        num_return_sequences=1
+    )
+    
+    # Extract only the generated text for each prompt
+    responses = []
+    for i in range(len(prompts)):
+        response_start = inputs.input_ids[i].shape[0]
+        response = outputs[i][response_start:]
+        responses.append(tokenizer.decode(response, skip_special_tokens=True).strip())
+    
+    return responses
+
+# === Endpoints ===
+@app.post("/ask", dependencies=[Depends(validate_api_key)])
+async def ask_llm(
+    request: Request, 
+    prompt_input: PromptInput, 
+    background_tasks: BackgroundTasks
+):
+    # Wait for model to load
+    if not model_loaded.is_set():
+        await model_loaded.wait()
+    
+    req_id = request.state.request_id
+    
+    if prompt_input.stream:
+        # Check stream concurrency
+        if len(background_tasks.tasks) >= MAX_CONCURRENT_STREAMS:
+            raise HTTPException(
+                status_code=429, 
+                detail="Too many concurrent streams"
+            )
+            
+        return StreamingResponse(
+            generate_stream(
+                prompt_input.prompt, 
+                prompt_input.max_tokens, 
+                prompt_input.temperature
+            ),
+            media_type="application/x-ndjson"
+        )
+    
+    # Non-streaming response
+    response = generate_response(
+        prompt_input.prompt, 
+        prompt_input.max_tokens, 
+        prompt_input.temperature
+    )
+    
+    return {
+        "response": response,
+        "id": req_id,
+        "timestamp": datetime.datetime.utcnow().isoformat()
+    }
+
+@app.post("/batch", dependencies=[Depends(validate_api_key)])
+async def batch_llm(request: Request, batch_input: BatchPromptInput):
+    # Wait for model to load
+    if not model_loaded.is_set():
+        await model_loaded.wait()
+    
+    req_id = request.state.request_id
+    
+    # Process in batches
+    all_results = []
+    for i in range(0, len(batch_input.prompts), BATCH_SIZE):
+        batch = batch_input.prompts[i:i+BATCH_SIZE]
+        results = process_batch(
+            batch,
+            batch_input.max_tokens,
+            batch_input.temperature
+        )
+        all_results.extend(results)
+    
+    return {
+        "responses": all_results,
+        "count": len(all_results),
+        "batch_id": req_id,
+        "timestamp": datetime.datetime.utcnow().isoformat()
+    }
+
+@app.get("/info")
+async def get_info(request: Request):
+    status = "ready" if model_loaded.is_set() else "initializing"
+    device_info = str(model.device) if model else "N/A"
+    
+    return {
+        "model": MODEL_NAME,
+        "status": status,
+        "device": device_info,
+        "gpu_enabled": GPU_ENABLED,
+        "rate_limit": MAX_REQUESTS_PER_MINUTE,
+        "batch_size": BATCH_SIZE,
+        "max_streams": MAX_CONCURRENT_STREAMS,
+        "version": app.version
+    }
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy" if model_loaded.is_set() else "initializing",
+        "model_loaded": model_loaded.is_set(),
+        "timestamp": datetime.datetime.utcnow().isoformat()
+    }
+
+# === Launch ===
+if __name__ == "__main__":
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000, 
+        workers=1  # Multiple workers cause issues with GPU models
+    )
