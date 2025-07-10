@@ -12,14 +12,15 @@ from redis import asyncio as aioredis
 from contextlib import asynccontextmanager
 from prometheus_fastapi_instrumentator import Instrumentator
 import uvicorn
-from typing import List, Generator
+from typing import List, Generator, Dict, Any
 import asyncio
 import json
 import threading
 import contextvars
+import re
 
 # === Configuration ===
-MODEL_NAME = os.getenv("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/phi-2")
 API_KEY = os.getenv("API_KEY", "default_secret_key")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "120"))
@@ -34,6 +35,19 @@ SYSTEM_PROMPT = (
     "You are AyAI, a specialized AI assistant developed for the AySearch project. "
     "Your mission is to evaluate web content in terms of safety, quality, and meaning. "
     "When necessary, provide short summaries and deliver objective, accurate feedback to the user."
+)
+
+# === Analysis System Prompt (English) ===
+ANALYSIS_PROMPT = (
+    "Perform a comprehensive analysis of the following text and provide ONLY JSON output with these keys:\n"
+    "- \"summary\": concise summary (max 30 words)\n"
+    "- \"is_safe\": boolean indicating safety (check for violence, hate, explicit content)\n"
+    "- \"language\": ISO 639-1 language code\n"
+    "- \"keywords\": top 5 keywords (array)\n"
+    "- \"quality_score\": content quality rating 1-10\n"
+    "- \"sentiment\": sentiment analysis (positive, negative, neutral)\n"
+    "- \"readability\": readability score 1-10\n"
+    "Text: {text}"
 )
 
 # === Logging Setup ===
@@ -104,9 +118,9 @@ async def lifespan(app: FastAPI):
         logger.info("Redis connection closed")
 
 # Create app with lifespan
-app = FastAPI(lifespan=lifespan, title="AyAI Service", version="1.0")
+app = FastAPI(lifespan=lifespan, title="AyAI Service", version="2.0")
 
-# Instrument the app (must be done AFTER app creation but BEFORE routes are added)
+# Instrument the app
 instrumentator.instrument(app)
 
 # === Rate Limiting Middleware ===
@@ -125,9 +139,11 @@ async def rate_limit_middleware(request: Request, call_next):
     endpoint = request.url.path
     client_ip = request.client.host if request.client else "unknown"
     
+    # Default cost
+    cost = 1
+    
     try:
-        # Calculate cost based on endpoint
-        cost = 1
+        # Adjust cost based on endpoint
         if endpoint == "/batch" and request.method == "POST":
             # Read body for batch requests
             body = await request.body()
@@ -138,6 +154,8 @@ async def rate_limit_middleware(request: Request, call_next):
                 cost = 10
             # Restore body for downstream processing
             request._body = body
+        elif endpoint == "/analyze" and request.method == "POST":
+            cost = 3  # Higher cost for analysis
         
         # Apply rate limit if Redis is available
         if redis_client:
@@ -217,6 +235,10 @@ class BatchPromptInput(BaseModel):
     max_tokens: int = Field(default=500, ge=1, le=2048)
     temperature: float = Field(default=0.7, ge=0.1, le=1.0)
 
+class AnalyzeInput(BaseModel):
+    text: str = Field(..., min_length=10, max_length=5000)
+    detailed: bool = Field(default=False)  # For enhanced analysis
+
 # === API Key Validation ===
 async def validate_api_key(request: Request):
     if request.headers.get("x-api-key") != API_KEY:
@@ -294,7 +316,7 @@ async def generate_stream(prompt: str, max_tokens: int, temperature: float) -> G
     # Stream tokens as they're generated
     for token in streamer:
         yield json.dumps({"token": token}) + "\n"
-        await asyncio.sleep(0.001)  # Yield control to event loop
+        await asyncio.sleep(0.001)
 
 # === Batch Processing ===
 def process_batch(prompts: List[str], max_tokens: int, temperature: float) -> List[str]:
@@ -325,6 +347,69 @@ def process_batch(prompts: List[str], max_tokens: int, temperature: float) -> Li
         responses.append(tokenizer.decode(response, skip_special_tokens=True).strip())
     
     return responses
+
+# === Analysis Functions ===
+def analyze_text(text: str) -> Dict[str, Any]:
+    """Analyze text and return structured JSON"""
+    formatted_prompt = ANALYSIS_PROMPT.format(text=text)
+    
+    try:
+        # Get model response
+        response = generate_response(
+            prompt=formatted_prompt,
+            max_tokens=600,  # More tokens for detailed analysis
+            temperature=0.3  # More deterministic output
+        )
+        
+        # Extract JSON part
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if not json_match:
+            logger.error(f"JSON output not found in: {response}")
+            return {"error": "Analysis output could not be processed"}
+        
+        # Parse and validate JSON
+        result = json.loads(json_match.group())
+        
+        # Validate required keys
+        required_keys = ["summary", "is_safe", "language", "keywords", "quality_score"]
+        for key in required_keys:
+            if key not in result:
+                logger.warning(f"Missing key in analysis: {key}")
+                result[key] = None
+        
+        return result
+    
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON in response: {response}")
+        return {"error": "Invalid JSON in analysis output"}
+    except Exception as e:
+        logger.error(f"Analysis error: {str(e)}")
+        return {"error": "Error during analysis"}
+
+def enhanced_analysis(base_result: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Enhance the base analysis with additional metrics"""
+    # If the base analysis has an error, skip
+    if "error" in base_result:
+        return base_result
+    
+    # Add processing timestamp
+    base_result["enhanced_timestamp"] = datetime.datetime.utcnow().isoformat()
+    
+    # Add word count and character count
+    base_result["word_count"] = len(text.split())
+    base_result["char_count"] = len(text)
+    
+    # Calculate keyword density if possible
+    if "keywords" in base_result and isinstance(base_result["keywords"], list):
+        text_lower = text.lower()
+        keyword_density = {}
+        for keyword in base_result["keywords"]:
+            count = text_lower.count(keyword.lower())
+            density = count / len(text.split()) * 100 if text else 0
+            keyword_density[keyword] = f"{density:.2f}%"
+        base_result["keyword_density"] = keyword_density
+    
+    return base_result
 
 # === Endpoints ===
 @app.post("/ask", dependencies=[Depends(validate_api_key)])
@@ -395,6 +480,38 @@ async def batch_llm(request: Request, batch_input: BatchPromptInput):
         "timestamp": datetime.datetime.utcnow().isoformat()
     }
 
+@app.post("/analyze", dependencies=[Depends(validate_api_key)])
+async def analyze_content(
+    request: Request, 
+    analyze_input: AnalyzeInput,
+    background_tasks: BackgroundTasks
+):
+    # Wait for model to load
+    if not model_loaded.is_set():
+        await model_loaded.wait()
+    
+    req_id = request.state.request_id
+    logger.info(f"Analysis request started: {req_id}")
+    
+    # Perform base analysis
+    start_time = time.time()
+    analysis_result = analyze_text(analyze_input.text)
+    
+    # If detailed analysis is requested
+    if analyze_input.detailed:
+        analysis_result = enhanced_analysis(analysis_result, analyze_input.text)
+    
+    # Add processing time
+    processing_time = time.time() - start_time
+    analysis_result["processing_time"] = f"{processing_time:.2f}s"
+    
+    return {
+        "analysis": analysis_result,
+        "id": req_id,
+        "text_length": len(analyze_input.text),
+        "timestamp": datetime.datetime.utcnow().isoformat()
+    }
+
 @app.get("/info")
 async def get_info(request: Request):
     status = "ready" if model_loaded.is_set() else "initializing"
@@ -425,5 +542,5 @@ if __name__ == "__main__":
         app, 
         host="0.0.0.0", 
         port=8000, 
-        workers=1  # Multiple workers cause issues with GPU models
+        workers=1
     )
