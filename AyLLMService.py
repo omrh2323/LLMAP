@@ -20,11 +20,11 @@ import contextvars
 import re
 
 # === Configuration ===
-MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/phi-2")
+MODEL_NAME = os.getenv("MODEL_NAME", "HuggingFaceH4/zephyr‑7b‑beta")
 API_KEY = os.getenv("API_KEY", "default_secret_key")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "120"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 MAX_CONCURRENT_STREAMS = int(os.getenv("MAX_CONCURRENT_STREAMS", "10"))
 GPU_ENABLED = torch.cuda.is_available() and os.getenv("USE_GPU", "true").lower() == "true"
 DEVICE = "cuda" if GPU_ENABLED else "cpu"
@@ -259,7 +259,7 @@ def generate_response(prompt: str, max_tokens: int, temperature: float) -> str:
             formatted_prompt, 
             return_tensors="pt",
             truncation=True, 
-            max_length=2048
+            max_length=4096
         ).to(model.device)
         
         outputs = model.generate(
