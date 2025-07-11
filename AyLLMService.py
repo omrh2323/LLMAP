@@ -22,7 +22,7 @@ import backoff
 import gc
 
 # === Configuration ===
-MODEL_NAME = os.getenv("MODEL_NAME", "HuggingFaceH4/zephyr-7b-beta")
+MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/phi-2")
 API_KEY = os.getenv("API_KEY", "default_secret_key")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "120"))
