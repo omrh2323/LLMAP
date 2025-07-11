@@ -12,12 +12,14 @@ from redis import asyncio as aioredis
 from contextlib import asynccontextmanager
 from prometheus_fastapi_instrumentator import Instrumentator
 import uvicorn
-from typing import List, Generator, Dict, Any
+from typing import List, Generator, Dict, Any, Optional
 import asyncio
 import json
 import threading
 import contextvars
 import re
+import backoff
+import gc
 
 # === Configuration ===
 MODEL_NAME = os.getenv("MODEL_NAME", "HuggingFaceH4/zephyr-7b-beta")
@@ -75,7 +77,7 @@ model = None
 tokenizer = None
 model_loading_lock = asyncio.Lock()
 model_loaded = asyncio.Event()
-model_loading_failed = asyncio.Event()  # Yeni: Model yükleme hatası izleme
+model_loading_failed = asyncio.Event()
 redis_client = None
 
 # === Instrumentation Setup ===
@@ -84,7 +86,7 @@ instrumentator = Instrumentator()
 # === App Lifecycle ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client
+    global redis_client, model, tokenizer
     
     # Initialize Redis
     try:
@@ -102,24 +104,32 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Cleanup resources
-    global model
-    if model:
+    # Cleanup resources with null checks
+    if model is not None:
         if GPU_ENABLED:
             with torch.no_grad():
                 torch.cuda.empty_cache()
         del model
+        model = None
         logger.info("Model resources released")
     
-    if tokenizer:
+    if tokenizer is not None:
         del tokenizer
+        tokenizer = None
+        logger.info("Tokenizer released")
     
-    if redis_client:
+    if redis_client is not None:
         await redis_client.close()
+        redis_client = None
         logger.info("Redis connection closed")
+    
+    # Force garbage collection
+    gc.collect()
+    if GPU_ENABLED:
+        torch.cuda.empty_cache()
 
 # Create app with lifespan
-app = FastAPI(lifespan=lifespan, title="AyAI Service", version="2.0")
+app = FastAPI(lifespan=lifespan, title="AyAI Service", version="2.1")
 
 # Instrument the app
 instrumentator.instrument(app)
@@ -183,7 +193,16 @@ async def rate_limit_middleware(request: Request, call_next):
         logger.error(f"Middleware error: {str(e)}")
         return await call_next(request)
 
-# === Model Loading ===
+# === Model Loading with Backoff ===
+@backoff.on_exception(backoff.expo, 
+                      (OSError, RuntimeError, ConnectionError), 
+                      max_tries=5, 
+                      jitter=backoff.full_jitter,
+                      logger=logger)
+async def safe_model_load(**kwargs):
+    """Safely load model with retry logic"""
+    return AutoModelForCausalLM.from_pretrained(**kwargs)
+
 async def load_model():
     global model, tokenizer
     async with model_loading_lock:
@@ -208,19 +227,8 @@ async def load_model():
             if GPU_ENABLED:
                 load_kwargs["device_map"] = "auto"
             
-            # Model indirme işlemi için yeniden deneme mekanizması
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait_time = 10 * (attempt + 1)
-                        logger.warning(f"Model loading attempt {attempt+1} failed. Retrying in {wait_time} seconds...")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        raise
+            # Load model with retry logic
+            model = await safe_model_load(MODEL_NAME, **load_kwargs)
             
             # Use BetterTransformer if available
             if GPU_ENABLED and hasattr(model, "to_bettertransformer"):
@@ -232,9 +240,8 @@ async def load_model():
             
         except Exception as e:
             logger.critical(f"Model loading failed: {str(e)}")
-            model_loading_failed.set()  # Hata durumunu işaretle
-            model_loaded.set()  # Bekleyen isteklerin devam etmesi için
-            # Uygulama çalışmaya devam eder ama istekler hata döner
+            model_loading_failed.set()
+            model_loaded.set()
 
 # === Request Models ===
 class PromptInput(BaseModel):
@@ -265,7 +272,6 @@ def format_prompt(prompt: str) -> str:
     return f"{SYSTEM_PROMPT}\n\nUser: {prompt}\nAyAI:"
 
 def generate_response(prompt: str, max_tokens: int, temperature: float) -> str:
-    # Model yüklenemediyse hata dön
     if model_loading_failed.is_set():
         return "Error: Model failed to load"
 
@@ -301,7 +307,6 @@ def generate_response(prompt: str, max_tokens: int, temperature: float) -> str:
         return "Error: Generation failed"
 
 async def generate_stream(prompt: str, max_tokens: int, temperature: float) -> Generator[str, None, None]:
-    # Model yüklenemediyse hata dön
     if model_loading_failed.is_set():
         yield json.dumps({"error": "Model failed to load"}) + "\n"
         return
@@ -336,50 +341,105 @@ async def generate_stream(prompt: str, max_tokens: int, temperature: float) -> G
     thread.start()
     
     # Stream tokens as they're generated
-    for token in streamer:
-        yield json.dumps({"token": token}) + "\n"
-        await asyncio.sleep(0.001)
+    try:
+        async for token in streamer:
+            yield json.dumps({"token": token}) + "\n"
+            await asyncio.sleep(0.001)
+    except Exception as e:
+        logger.error(f"Streaming error: {str(e)}")
+        yield json.dumps({"error": "Stream interrupted"}) + "\n"
 
 # === Batch Processing ===
 def process_batch(prompts: List[str], max_tokens: int, temperature: float) -> List[str]:
-    # Model yüklenemediyse hata dön
     if model_loading_failed.is_set():
         return ["Error: Model failed to load"] * len(prompts)
 
     formatted_prompts = [format_prompt(p) for p in prompts]
     
-    inputs = tokenizer(
-        formatted_prompts,
-        padding=True,
-        truncation=True,
-        max_length=2048,
-        return_tensors="pt"
-    ).to(model.device)
+    try:
+        inputs = tokenizer(
+            formatted_prompts,
+            padding=True,
+            truncation=True,
+            max_length=2048,
+            return_tensors="pt"
+        ).to(model.device)
+        
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+            num_return_sequences=1
+        )
+        
+        # Extract only the generated text for each prompt
+        responses = []
+        for i in range(len(prompts)):
+            response_start = inputs.input_ids[i].shape[0]
+            response = outputs[i][response_start:]
+            responses.append(tokenizer.decode(response, skip_special_tokens=True).strip())
+        
+        return responses
     
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=max_tokens,
-        temperature=temperature,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id,
-        num_return_sequences=1
-    )
-    
-    # Extract only the generated text for each prompt
-    responses = []
-    for i in range(len(prompts)):
-        response_start = inputs.input_ids[i].shape[0]
-        response = outputs[i][response_start:]
-        responses.append(tokenizer.decode(response, skip_special_tokens=True).strip())
-    
-    return responses
+    except torch.cuda.OutOfMemoryError:
+        logger.error("CUDA out of memory during batch processing")
+        return ["Error: System overloaded, please try again"] * len(prompts)
+    except Exception as e:
+        logger.error(f"Batch processing error: {str(e)}")
+        return ["Error: Processing failed"] * len(prompts)
 
-# === Analysis Functions ===
+# === Enhanced Analysis Functions ===
+def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
+    """Robust JSON extraction from model response"""
+    # Try to find complete JSON structure
+    json_match = re.search(r'\{[\s\S]*\}', response)
+    if json_match:
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            # Attempt to fix common formatting issues
+            try:
+                # Fix unescaped quotes
+                fixed_json = re.sub(r'([^\\])\\"', r'\1\\\\"', json_match.group())
+                # Fix trailing commas
+                fixed_json = re.sub(r',\s*([}\]])', r'\1', fixed_json)
+                return json.loads(fixed_json)
+            except:
+                pass
+    
+    # Fallback: Find JSON-like structures
+    try:
+        # Attempt to parse the entire response as JSON
+        return json.loads(response)
+    except:
+        # Try to find the first valid JSON object
+        start_idx = response.find('{')
+        while start_idx != -1:
+            end_idx = start_idx + 1
+            brace_count = 1
+            while end_idx < len(response) and brace_count > 0:
+                if response[end_idx] == '{':
+                    brace_count += 1
+                elif response[end_idx] == '}':
+                    brace_count -= 1
+                end_idx += 1
+            
+            if brace_count == 0:
+                try:
+                    return json.loads(response[start_idx:end_idx])
+                except:
+                    pass
+            
+            start_idx = response.find('{', start_idx + 1)
+    
+    return None
+
 def analyze_text(text: str) -> Dict[str, Any]:
     """Analyze text and return structured JSON"""
-    # Model yüklenemediyse hata dön
     if model_loading_failed.is_set():
-        return {"error": "Model failed to load"}
+        return {"error": "Model failed to load", "status": "unavailable"}
 
     formatted_prompt = ANALYSIS_PROMPT.format(text=text)
     
@@ -387,18 +447,16 @@ def analyze_text(text: str) -> Dict[str, Any]:
         # Get model response
         response = generate_response(
             prompt=formatted_prompt,
-            max_tokens=600,  # More tokens for detailed analysis
-            temperature=0.3  # More deterministic output
+            max_tokens=600,
+            temperature=0.3
         )
         
         # Extract JSON part
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-        if not json_match:
-            logger.error(f"JSON output not found in: {response}")
-            return {"error": "Analysis output could not be processed"}
+        result = extract_json_from_response(response)
         
-        # Parse and validate JSON
-        result = json.loads(json_match.group())
+        if not result:
+            logger.error(f"JSON output not found in: {response[:200]}...")
+            return {"error": "Analysis output could not be processed"}
         
         # Validate required keys
         required_keys = ["summary", "is_safe", "language", "keywords", "quality_score"]
@@ -409,35 +467,37 @@ def analyze_text(text: str) -> Dict[str, Any]:
         
         return result
     
-    except json.JSONDecodeError:
-        logger.error(f"Invalid JSON in response: {response}")
-        return {"error": "Invalid JSON in analysis output"}
     except Exception as e:
         logger.error(f"Analysis error: {str(e)}")
         return {"error": "Error during analysis"}
 
 def enhanced_analysis(base_result: Dict[str, Any], text: str) -> Dict[str, Any]:
     """Enhance the base analysis with additional metrics"""
-    # If the base analysis has an error, skip
     if "error" in base_result:
         return base_result
     
-    # Add processing timestamp
-    base_result["enhanced_timestamp"] = datetime.datetime.utcnow().isoformat()
-    
-    # Add word count and character count
+    # Add processing metadata
+    base_result["analysis_timestamp"] = datetime.datetime.utcnow().isoformat()
     base_result["word_count"] = len(text.split())
     base_result["char_count"] = len(text)
     
-    # Calculate keyword density if possible
+    # Calculate keyword metrics if possible
     if "keywords" in base_result and isinstance(base_result["keywords"], list):
         text_lower = text.lower()
-        keyword_density = {}
+        keyword_metrics = []
+        total_words = len(text.split())
+        
         for keyword in base_result["keywords"]:
-            count = text_lower.count(keyword.lower())
-            density = count / len(text.split()) * 100 if text else 0
-            keyword_density[keyword] = f"{density:.2f}%"
-        base_result["keyword_density"] = keyword_density
+            if isinstance(keyword, str):
+                count = text_lower.count(keyword.lower())
+                density = (count / total_words * 100) if total_words > 0 else 0
+                keyword_metrics.append({
+                    "keyword": keyword,
+                    "count": count,
+                    "density": f"{density:.2f}%"
+                })
+        
+        base_result["keyword_metrics"] = keyword_metrics
     
     return base_result
 
@@ -454,7 +514,6 @@ async def ask_llm(
     
     req_id = request.state.request_id
     
-    # Model yükleme hatası kontrolü
     if model_loading_failed.is_set():
         raise HTTPException(
             status_code=500,
@@ -462,7 +521,6 @@ async def ask_llm(
         )
     
     if prompt_input.stream:
-        # Check stream concurrency
         if len(background_tasks.tasks) >= MAX_CONCURRENT_STREAMS:
             raise HTTPException(
                 status_code=429, 
@@ -493,11 +551,9 @@ async def ask_llm(
 
 @app.post("/batch", dependencies=[Depends(validate_api_key)])
 async def batch_llm(request: Request, batch_input: BatchPromptInput):
-    # Wait for model to load
     if not model_loaded.is_set():
         await model_loaded.wait()
     
-    # Model yükleme hatası kontrolü
     if model_loading_failed.is_set():
         raise HTTPException(
             status_code=500,
@@ -530,11 +586,9 @@ async def analyze_content(
     analyze_input: AnalyzeInput,
     background_tasks: BackgroundTasks
 ):
-    # Wait for model to load
     if not model_loaded.is_set():
         await model_loaded.wait()
     
-    # Model yükleme hatası kontrolü
     if model_loading_failed.is_set():
         raise HTTPException(
             status_code=500,
@@ -552,9 +606,10 @@ async def analyze_content(
     if analyze_input.detailed:
         analysis_result = enhanced_analysis(analysis_result, analyze_input.text)
     
-    # Add processing time
+    # Add processing metrics
     processing_time = time.time() - start_time
-    analysis_result["processing_time"] = f"{processing_time:.2f}s"
+    analysis_result["processing_time_sec"] = f"{processing_time:.2f}"
+    analysis_result["request_id"] = req_id
     
     return {
         "analysis": analysis_result,
@@ -602,5 +657,6 @@ if __name__ == "__main__":
         app, 
         host="0.0.0.0", 
         port=8080, 
-        workers=1
+        workers=1,
+        timeout_keep_alive=60
     )
