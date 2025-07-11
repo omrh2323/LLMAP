@@ -20,6 +20,12 @@ import contextvars
 import re
 import backoff
 import gc
+import hashlib
+import requests
+from tqdm import tqdm
+from huggingface_hub import hf_hub_url, get_hf_file_metadata
+from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError, EntryNotFoundError, HfHubHTTPError
+import psutil
 
 # === Configuration ===
 MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/phi-2")
@@ -31,6 +37,9 @@ MAX_CONCURRENT_STREAMS = int(os.getenv("MAX_CONCURRENT_STREAMS", "10"))
 GPU_ENABLED = torch.cuda.is_available() and os.getenv("USE_GPU", "true").lower() == "true"
 DEVICE = "cuda" if GPU_ENABLED else "cpu"
 DTYPE = torch.float16 if GPU_ENABLED else torch.float32
+HF_TOKEN = os.getenv("HF_TOKEN", None)
+MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "./model_cache")
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 
 # === System Prompt ===
 SYSTEM_PROMPT = (
@@ -83,6 +92,144 @@ redis_client = None
 # === Instrumentation Setup ===
 instrumentator = Instrumentator()
 
+# === Enhanced Download Functions ===
+def calculate_file_hash(file_path: str, chunk_size: int = 8192) -> str:
+    """Calculate SHA256 hash of a file"""
+    sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        while chunk := f.read(chunk_size):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+def download_with_resume(url: str, local_path: str, expected_hash: str = None, max_retries: int = MAX_RETRIES) -> bool:
+    """Robust file download with resume, retry, and hash verification"""
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    
+    for attempt in range(max_retries):
+        try:
+            # Check existing file
+            file_exists = False
+            if os.path.exists(local_path):
+                file_exists = True
+                if expected_hash:
+                    file_hash = calculate_file_hash(local_path)
+                    if file_hash == expected_hash:
+                        logger.info(f"File already exists and hash matches: {local_path}")
+                        return True
+                    logger.warning(f"File exists but hash mismatch: {file_hash} vs {expected_hash}, redownloading")
+                
+                # Resume download
+                headers = {}
+                file_size = os.path.getsize(local_path)
+                headers['Range'] = f'bytes={file_size}-'
+            else:
+                file_size = 0
+            
+            with requests.get(url, stream=True, headers=headers, timeout=30) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0)) + file_size
+                
+                # Append mode if resuming, otherwise write new
+                mode = 'ab' if file_size > 0 else 'wb'
+                with open(local_path, mode) as f, tqdm(
+                    total=total_size, 
+                    unit='B', 
+                    unit_scale=True, 
+                    desc=os.path.basename(local_path),
+                    initial=file_size
+                ) as progress_bar:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            progress_bar.update(len(chunk))
+            
+            # Verify hash if provided
+            if expected_hash:
+                file_hash = calculate_file_hash(local_path)
+                if file_hash != expected_hash:
+                    raise ValueError(f"Hash mismatch after download: {file_hash} vs {expected_hash}")
+            
+            return True
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.error(f"Download attempt {attempt+1} failed: {str(e)}")
+            if file_exists and os.path.exists(local_path):
+                os.remove(local_path)
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"All download attempts failed for {url}")
+                return False
+
+def download_model_file(repo_id: str, filename: str) -> str:
+    """Download a single model file with robust error handling"""
+    # Get file metadata to get the expected hash
+    try:
+        url = hf_hub_url(repo_id, filename, token=HF_TOKEN)
+        file_metadata = get_hf_file_metadata(url, token=HF_TOKEN)
+        expected_hash = file_metadata.commit_hash
+    except Exception as e:
+        logger.warning(f"Could not get file metadata for {filename}: {str(e)}. Skipping hash verification.")
+        expected_hash = None
+
+    # Create local path
+    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+    local_path = os.path.join(MODEL_CACHE_DIR, filename)
+    
+    # Download with resume and hash verification
+    success = download_with_resume(url, local_path, expected_hash)
+    if not success:
+        raise RuntimeError(f"Failed to download {filename} after multiple attempts")
+    
+    return local_path
+
+# === Robust Model Loading ===
+@backoff.on_exception(backoff.expo, 
+                      (OSError, RuntimeError, ConnectionError,
+                       RepositoryNotFoundError, RevisionNotFoundError, HfHubHTTPError,
+                       torch.cuda.OutOfMemoryError, ValueError), 
+                      max_tries=MAX_RETRIES, 
+                      jitter=backoff.full_jitter,
+                      logger=logger,
+                      giveup=lambda e: isinstance(e, RepositoryNotFoundError))
+def safe_model_load(model_name: str, **kwargs) -> torch.nn.Module:
+    """Safely load model with retry logic and fallback"""
+    try:
+        # First try with GPU if enabled
+        if GPU_ENABLED:
+            logger.info("Attempting GPU model load")
+            return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+        
+        # Fallback to CPU
+        logger.warning("Falling back to CPU model load")
+        kwargs['device_map'] = 'cpu'
+        kwargs['torch_dtype'] = torch.float32
+        return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    
+    except torch.cuda.OutOfMemoryError:
+        logger.error("CUDA out of memory, trying CPU fallback")
+        kwargs['device_map'] = 'cpu'
+        kwargs['torch_dtype'] = torch.float32
+        return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    
+    except Exception as e:
+        logger.error(f"Model loading failed: {str(e)}")
+        raise
+
+# === Memory Management ===
+def log_memory_usage():
+    """Log detailed memory usage information"""
+    if GPU_ENABLED and torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            mem_alloc = torch.cuda.memory_allocated(i) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(i) / 1024**3
+            logger.info(f"GPU {i} Memory: Allocated={mem_alloc:.2f}GB, Reserved={mem_reserved:.2f}GB")
+    
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    logger.info(f"RAM Usage: RSS={mem_info.rss/1024**2:.2f}MB, VMS={mem_info.vms/1024**2:.2f}MB")
+
 # === App Lifecycle ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -104,105 +251,57 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Cleanup resources with null checks
+    # Cleanup resources
+    cleanup_success = True
     if model is not None:
-        if GPU_ENABLED:
-            with torch.no_grad():
-                torch.cuda.empty_cache()
-        del model
-        model = None
-        logger.info("Model resources released")
+        try:
+            del model
+            model = None
+            logger.info("Model resources released")
+        except Exception as e:
+            logger.error(f"Model cleanup failed: {str(e)}")
+            cleanup_success = False
     
     if tokenizer is not None:
-        del tokenizer
-        tokenizer = None
-        logger.info("Tokenizer released")
+        try:
+            del tokenizer
+            tokenizer = None
+            logger.info("Tokenizer released")
+        except Exception as e:
+            logger.error(f"Tokenizer cleanup failed: {str(e)}")
+            cleanup_success = False
     
     if redis_client is not None:
-        await redis_client.close()
-        redis_client = None
-        logger.info("Redis connection closed")
+        try:
+            await redis_client.close()
+            redis_client = None
+            logger.info("Redis connection closed")
+        except Exception as e:
+            logger.error(f"Redis close failed: {str(e)}")
+            cleanup_success = False
     
-    # Force garbage collection
+    # Force cleanup
     gc.collect()
     if GPU_ENABLED:
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.ipc_collect()
+            logger.info("CUDA cache cleared")
+        except Exception as e:
+            logger.error(f"CUDA cleanup failed: {str(e)}")
+            cleanup_success = False
+    
+    log_memory_usage()
+    logger.info(f"Cleanup completed {'successfully' if cleanup_success else 'with errors'}")
 
 # Create app with lifespan
-app = FastAPI(lifespan=lifespan, title="AyAI Service", version="2.1")
+app = FastAPI(lifespan=lifespan, title="AyAI Service", version="2.4")
 
 # Instrument the app
 instrumentator.instrument(app)
 
-# === Rate Limiting Middleware ===
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    # Generate request ID and set in context
-    req_id = str(uuid.uuid4())
-    request_id_ctx.set(req_id)
-    request.state.request_id = req_id
-    
-    # Skip rate limiting for health and info endpoints
-    if request.url.path in ["/health", "/info"]:
-        return await call_next(request)
-    
-    # Apply rate limiting
-    endpoint = request.url.path
-    client_ip = request.client.host if request.client else "unknown"
-    
-    # Default cost
-    cost = 1
-    
-    try:
-        # Adjust cost based on endpoint
-        if endpoint == "/batch" and request.method == "POST":
-            # Read body for batch requests
-            body = await request.body()
-            try:
-                data = json.loads(body)
-                cost = min(len(data.get("prompts", [])), 10)
-            except:
-                cost = 10
-            # Restore body for downstream processing
-            request._body = body
-        elif endpoint == "/analyze" and request.method == "POST":
-            cost = 3  # Higher cost for analysis
-        
-        # Apply rate limit if Redis is available
-        if redis_client:
-            key = f"rate_limit:{client_ip}:{endpoint}"
-            current = await redis_client.get(key)
-            current = int(current) if current else 0
-            
-            if current + cost > MAX_REQUESTS_PER_MINUTE:
-                logger.warning(f"Rate limit exceeded for {client_ip} on {endpoint}")
-                raise HTTPException(status_code=429, detail="Too many requests")
-            
-            # Update rate limit
-            await redis_client.incrby(key, cost)
-            if current == 0:
-                await redis_client.expire(key, 60)
-        
-        # Process request
-        response = await call_next(request)
-        return response
-        
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"Middleware error: {str(e)}")
-        return await call_next(request)
-
-# === Model Loading with Backoff ===
-@backoff.on_exception(backoff.expo, 
-                      (OSError, RuntimeError, ConnectionError), 
-                      max_tries=5, 
-                      jitter=backoff.full_jitter,
-                      logger=logger)
-async def safe_model_load(**kwargs):
-    """Safely load model with retry logic"""
-    return AutoModelForCausalLM.from_pretrained(**kwargs)
-
+# === Model Loading with Integrity Check ===
 async def load_model():
     global model, tokenizer
     async with model_loading_lock:
@@ -213,33 +312,72 @@ async def load_model():
         start_time = time.time()
         
         try:
-            # Load tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
+            log_memory_usage()
+            
+            # Attempt to load tokenizer first
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    MODEL_NAME, 
+                    token=HF_TOKEN,
+                    cache_dir=MODEL_CACHE_DIR
+                )
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                logger.info("Tokenizer loaded successfully")
+            except Exception as e:
+                logger.error(f"Tokenizer loading failed: {str(e)}")
+                raise
             
             # Configuration for model loading
             load_kwargs = {
                 "torch_dtype": DTYPE,
                 "low_cpu_mem_usage": True,
+                "token": HF_TOKEN,
+                "cache_dir": MODEL_CACHE_DIR
             }
             
             if GPU_ENABLED:
-                load_kwargs["device_map"] = "auto"
+                # Use smarter device mapping for multi-GPU systems
+                if torch.cuda.device_count() > 1:
+                    load_kwargs["device_map"] = "balanced_low_0"
+                    logger.info("Using multi-GPU balanced loading")
+                else:
+                    load_kwargs["device_map"] = "auto"
             
             # Load model with retry logic
-            model = await safe_model_load(MODEL_NAME, **load_kwargs)
+            model = safe_model_load(MODEL_NAME, **load_kwargs)
+            
+            # Run a test inference to validate model
+            try:
+                test_input = tokenizer("Test input for model validation", return_tensors="pt").to(model.device)
+                with torch.no_grad():
+                    model(**test_input)
+                logger.info("Model validation successful")
+            except Exception as e:
+                logger.error(f"Model validation failed: {str(e)}")
+                raise RuntimeError("Model validation failed")
             
             # Use BetterTransformer if available
             if GPU_ENABLED and hasattr(model, "to_bettertransformer"):
-                model = model.to_bettertransformer()
-                logger.info("Using BetterTransformer optimization")
+                try:
+                    model = model.to_bettertransformer()
+                    logger.info("Using BetterTransformer optimization")
+                except Exception as e:
+                    logger.warning(f"BetterTransformer failed: {str(e)}")
             
             model_loaded.set()
             logger.info(f"Model loaded in {time.time() - start_time:.2f}s | Device: {model.device}")
+            log_memory_usage()
             
         except Exception as e:
             logger.critical(f"Model loading failed: {str(e)}")
+            # Attempt to free resources
+            if 'model' in locals():
+                try:
+                    del model
+                except:
+                    pass
+            model = None
             model_loading_failed.set()
             model_loaded.set()
 
@@ -257,7 +395,7 @@ class BatchPromptInput(BaseModel):
 
 class AnalyzeInput(BaseModel):
     text: str = Field(..., min_length=10, max_length=5000)
-    detailed: bool = Field(default=False)  # For enhanced analysis
+    detailed: bool = Field(default=False)
 
 # === API Key Validation ===
 async def validate_api_key(request: Request):
@@ -501,6 +639,65 @@ def enhanced_analysis(base_result: Dict[str, Any], text: str) -> Dict[str, Any]:
     
     return base_result
 
+# === Rate Limiting Middleware ===
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Generate request ID and set in context
+    req_id = str(uuid.uuid4())
+    request_id_ctx.set(req_id)
+    request.state.request_id = req_id
+    
+    # Skip rate limiting for health and info endpoints
+    if request.url.path in ["/health", "/info"]:
+        return await call_next(request)
+    
+    # Apply rate limiting
+    endpoint = request.url.path
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # Default cost
+    cost = 1
+    
+    try:
+        # Adjust cost based on endpoint
+        if endpoint == "/batch" and request.method == "POST":
+            # Read body for batch requests
+            body = await request.body()
+            try:
+                data = json.loads(body)
+                cost = min(len(data.get("prompts", [])), 10)
+            except:
+                cost = 10
+            # Restore body for downstream processing
+            request._body = body
+        elif endpoint == "/analyze" and request.method == "POST":
+            cost = 3  # Higher cost for analysis
+        
+        # Apply rate limit if Redis is available
+        if redis_client:
+            key = f"rate_limit:{client_ip}:{endpoint}"
+            current = await redis_client.get(key)
+            current = int(current) if current else 0
+            
+            if current + cost > MAX_REQUESTS_PER_MINUTE:
+                logger.warning(f"Rate limit exceeded for {client_ip} on {endpoint}")
+                raise HTTPException(status_code=429, detail="Too many requests")
+            
+            # Update rate limit
+            await redis_client.incrby(key, cost)
+            if current == 0:
+                await redis_client.expire(key, 60)
+        
+        # Process request
+        response = await call_next(request)
+        return response
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Middleware error: {str(e)}")
+        return await call_next(request)
+
 # === Endpoints ===
 @app.post("/ask", dependencies=[Depends(validate_api_key)])
 async def ask_llm(
@@ -653,6 +850,11 @@ async def health_check():
 
 # === Launch ===
 if __name__ == "__main__":
+    # Set Hugging Face environment variables for better stability
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "600"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
     uvicorn.run(
         app, 
         host="0.0.0.0", 
