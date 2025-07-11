@@ -31,6 +31,7 @@ MAX_CONCURRENT_STREAMS = int(os.getenv("MAX_CONCURRENT_STREAMS", "10"))
 GPU_ENABLED = torch.cuda.is_available() and os.getenv("USE_GPU", "true").lower() == "true"
 DEVICE = "cuda" if GPU_ENABLED else "cpu"
 DTYPE = torch.float16 if GPU_ENABLED else torch.float32
+PORT = int(os.getenv("PORT", 8080))  # Port configürasyonu eklendi
 
 # === System Prompt ===
 SYSTEM_PROMPT = (
@@ -119,7 +120,7 @@ async def lifespan(app: FastAPI):
         logger.info("Tokenizer released")
     
     if redis_client is not None:
-        await redis_client.close()
+        await redis_client.aclose()  # Düzeltildi: aclose() kullanılıyor
         redis_client = None
         logger.info("Redis connection closed")
     
@@ -199,9 +200,9 @@ async def rate_limit_middleware(request: Request, call_next):
                       max_tries=5, 
                       jitter=backoff.full_jitter,
                       logger=logger)
-async def safe_model_load(**kwargs):
+async def safe_model_load(pretrained_model_name_or_path: str, **kwargs):
     """Safely load model with retry logic"""
-    return AutoModelForCausalLM.from_pretrained(**kwargs)
+    return AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
 async def load_model():
     global model, tokenizer
@@ -342,7 +343,7 @@ async def generate_stream(prompt: str, max_tokens: int, temperature: float) -> G
     
     # Stream tokens as they're generated
     try:
-        async for token in streamer:
+        for token in streamer:
             yield json.dumps({"token": token}) + "\n"
             await asyncio.sleep(0.001)
     except Exception as e:
@@ -653,10 +654,14 @@ async def health_check():
 
 # === Launch ===
 if __name__ == "__main__":
-    uvicorn.run(
+    # Port çakışmasını önlemek için yeniden kullanım izni
+    config = uvicorn.Config(
         app, 
         host="0.0.0.0", 
-        port=8080, 
+        port=PORT,
         workers=1,
-        timeout_keep_alive=60
+        timeout_keep_alive=60,
+        reuse_port=True  # Port yeniden kullanımı için
     )
+    server = uvicorn.Server(config)
+    server.run()
