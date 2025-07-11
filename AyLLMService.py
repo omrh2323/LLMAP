@@ -75,6 +75,7 @@ model = None
 tokenizer = None
 model_loading_lock = asyncio.Lock()
 model_loaded = asyncio.Event()
+model_loading_failed = asyncio.Event()  # Yeni: Model yükleme hatası izleme
 redis_client = None
 
 # === Instrumentation Setup ===
@@ -186,7 +187,7 @@ async def rate_limit_middleware(request: Request, call_next):
 async def load_model():
     global model, tokenizer
     async with model_loading_lock:
-        if model_loaded.is_set():
+        if model_loaded.is_set() or model_loading_failed.is_set():
             return
             
         logger.info("Starting model loading...")
@@ -207,8 +208,19 @@ async def load_model():
             if GPU_ENABLED:
                 load_kwargs["device_map"] = "auto"
             
-            # Load model
-            model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
+            # Model indirme işlemi için yeniden deneme mekanizması
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **load_kwargs)
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = 10 * (attempt + 1)
+                        logger.warning(f"Model loading attempt {attempt+1} failed. Retrying in {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        raise
             
             # Use BetterTransformer if available
             if GPU_ENABLED and hasattr(model, "to_bettertransformer"):
@@ -220,8 +232,9 @@ async def load_model():
             
         except Exception as e:
             logger.critical(f"Model loading failed: {str(e)}")
-            model_loaded.set()  # Prevent blocking
-            raise RuntimeError("Model initialization failed") from e
+            model_loading_failed.set()  # Hata durumunu işaretle
+            model_loaded.set()  # Bekleyen isteklerin devam etmesi için
+            # Uygulama çalışmaya devam eder ama istekler hata döner
 
 # === Request Models ===
 class PromptInput(BaseModel):
@@ -252,6 +265,10 @@ def format_prompt(prompt: str) -> str:
     return f"{SYSTEM_PROMPT}\n\nUser: {prompt}\nAyAI:"
 
 def generate_response(prompt: str, max_tokens: int, temperature: float) -> str:
+    # Model yüklenemediyse hata dön
+    if model_loading_failed.is_set():
+        return "Error: Model failed to load"
+
     formatted_prompt = format_prompt(prompt)
     
     try:
@@ -284,6 +301,11 @@ def generate_response(prompt: str, max_tokens: int, temperature: float) -> str:
         return "Error: Generation failed"
 
 async def generate_stream(prompt: str, max_tokens: int, temperature: float) -> Generator[str, None, None]:
+    # Model yüklenemediyse hata dön
+    if model_loading_failed.is_set():
+        yield json.dumps({"error": "Model failed to load"}) + "\n"
+        return
+
     formatted_prompt = format_prompt(prompt)
     
     inputs = tokenizer(
@@ -320,6 +342,10 @@ async def generate_stream(prompt: str, max_tokens: int, temperature: float) -> G
 
 # === Batch Processing ===
 def process_batch(prompts: List[str], max_tokens: int, temperature: float) -> List[str]:
+    # Model yüklenemediyse hata dön
+    if model_loading_failed.is_set():
+        return ["Error: Model failed to load"] * len(prompts)
+
     formatted_prompts = [format_prompt(p) for p in prompts]
     
     inputs = tokenizer(
@@ -351,6 +377,10 @@ def process_batch(prompts: List[str], max_tokens: int, temperature: float) -> Li
 # === Analysis Functions ===
 def analyze_text(text: str) -> Dict[str, Any]:
     """Analyze text and return structured JSON"""
+    # Model yüklenemediyse hata dön
+    if model_loading_failed.is_set():
+        return {"error": "Model failed to load"}
+
     formatted_prompt = ANALYSIS_PROMPT.format(text=text)
     
     try:
@@ -424,6 +454,13 @@ async def ask_llm(
     
     req_id = request.state.request_id
     
+    # Model yükleme hatası kontrolü
+    if model_loading_failed.is_set():
+        raise HTTPException(
+            status_code=500,
+            detail="Model failed to load, service unavailable"
+        )
+    
     if prompt_input.stream:
         # Check stream concurrency
         if len(background_tasks.tasks) >= MAX_CONCURRENT_STREAMS:
@@ -460,6 +497,13 @@ async def batch_llm(request: Request, batch_input: BatchPromptInput):
     if not model_loaded.is_set():
         await model_loaded.wait()
     
+    # Model yükleme hatası kontrolü
+    if model_loading_failed.is_set():
+        raise HTTPException(
+            status_code=500,
+            detail="Model failed to load, service unavailable"
+        )
+    
     req_id = request.state.request_id
     
     # Process in batches
@@ -490,6 +534,13 @@ async def analyze_content(
     if not model_loaded.is_set():
         await model_loaded.wait()
     
+    # Model yükleme hatası kontrolü
+    if model_loading_failed.is_set():
+        raise HTTPException(
+            status_code=500,
+            detail="Model failed to load, service unavailable"
+        )
+    
     req_id = request.state.request_id
     logger.info(f"Analysis request started: {req_id}")
     
@@ -515,6 +566,8 @@ async def analyze_content(
 @app.get("/info")
 async def get_info(request: Request):
     status = "ready" if model_loaded.is_set() else "initializing"
+    if model_loading_failed.is_set():
+        status = "failed"
     device_info = str(model.device) if model else "N/A"
     
     return {
@@ -530,9 +583,16 @@ async def get_info(request: Request):
 
 @app.get("/health")
 async def health_check():
+    status = "healthy"
+    if model_loading_failed.is_set():
+        status = "unhealthy"
+    elif not model_loaded.is_set():
+        status = "initializing"
+    
     return {
-        "status": "healthy" if model_loaded.is_set() else "initializing",
+        "status": status,
         "model_loaded": model_loaded.is_set(),
+        "model_loading_failed": model_loading_failed.is_set(),
         "timestamp": datetime.datetime.utcnow().isoformat()
     }
 
